@@ -1,0 +1,64 @@
+.message-wrapper {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+  animation: fadeIn 0.3s ease-in-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.message-wrapper.user {
+  flex-direction: row-reverse;
+}
+
+.message-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  color: white;
+}
+
+.message-wrapper.agent .message-avatar {
+  background-color: var(--agent-msg-bg);
+  border: 1px solid var(--border-color);
+}
+
+.message-wrapper.user .message-avatar {
+  background-color: var(--user-msg-bg);
+}
+
+.message-content {
+  max-width: 80%;
+  display: flex;
+  flex-direction: column;
+}
+
+.message-wrapper.user .message-content {
+  align-items: flex-end;
+}
+
+.message-text {
+  padding: 0.75rem 1rem;
+  border-radius: 8px;
+  word-wrap: break-word;
+  white-space: pre-wrap;
+}
+
+.message-wrapper.agent .message-text {
+  background-color: transparent;
+  color: var(--text-primary);
+  padding: 0.25rem 0; /* Agent messages don't need a bubble background */
+}
+
+.message-wrapper.user .message-text {
+  background-color: var(--user-msg-bg);
+  color: white;
+  border-bottom-right-radius: 2px;
+}
