@@ -1,4 +1,19 @@
+# Environment files
 .env
+config.env
+*.env
+
+# Virtual environment & dependencies
 venv/
+node_modules/
+
+# Python cache & runtime outputs
 __pycache__/
+*.pyc
 mlruns/
+*.sqlite
+*.sqlite-*
+
+# Build & dump outputs
+dist/
+repomix-output.xml
