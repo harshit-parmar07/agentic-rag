@@ -15,7 +15,14 @@ pc = None
 if PINECONE_API_KEY:
     pc = Pinecone(api_key=PINECONE_API_KEY)
 
-embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+_embeddings = None
+
+def get_embeddings():
+    global _embeddings
+    if _embeddings is None:
+        print("Lazy loading HuggingFace embeddings model...")
+        _embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+    return _embeddings
 
 # Define Pinecone index name from config
 INDEX_NAME = PINECONE_INDEX_NAME
@@ -49,7 +56,7 @@ def get_retriever():
     """Initializes and returns the Pinecone vector store retriever."""
     ensure_index_exists()
     
-    vectorstore = PineconeVectorStore(index_name=INDEX_NAME, embedding=embeddings)
+    vectorstore = PineconeVectorStore(index_name=INDEX_NAME, embedding=get_embeddings())
     return vectorstore.as_retriever()
 
 # --- Function to add documents to the vector store ---
@@ -78,7 +85,7 @@ def add_document_to_vectorstore(text_content: str):
     ensure_index_exists()
     
     # Get the vectorstore instance (not the retriever) to add documents
-    vectorstore = PineconeVectorStore(index_name=INDEX_NAME, embedding=embeddings)
+    vectorstore = PineconeVectorStore(index_name=INDEX_NAME, embedding=get_embeddings())
     
     # Add documents to the vector store
     vectorstore.add_documents(documents)
