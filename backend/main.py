@@ -238,3 +238,10 @@ async def chat_with_agent(request: QueryRequest):
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+if __name__ == "__main__":
+    import uvicorn
+    # Port is injected by Render, defaulting to 8000 for local development
+    port = int(os.environ.get("PORT", 8000))
+    print(f"Starting server on 0.0.0.0:{port}...")
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
