@@ -18,3 +18,4 @@ requests
 uuid 
 langchain-huggingface
 langgraph-checkpoint-sqlite
+python-multipart
