@@ -17,3 +17,4 @@ mlruns/
 # Build & dump outputs
 dist/
 repomix-output.xml
+*.txt

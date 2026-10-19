@@ -5,12 +5,11 @@ from langchain_core.tools import tool
 from langchain_groq import ChatGroq
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
-import sqlite3
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.runnables import RunnableConfig
 from duckduckgo_search import DDGS
 
-from config import GROQ_API_KEY
+from config import GROQ_API_KEY, GROQ_MODEL
 from vectorstore import get_retriever
 
 
@@ -39,10 +38,10 @@ class RewrittenQuery(BaseModel):
 # --- LLM instances with structured output where needed ---
 os.environ["GROQ_API_KEY"] = GROQ_API_KEY or "dummy-key"
 
-router_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0).with_structured_output(RouteDecision)
-judge_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0).with_structured_output(RagJudge, method="json_mode")
-rewriter_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0).with_structured_output(RewrittenQuery)
-answer_llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0.7)
+router_llm = ChatGroq(model=GROQ_MODEL, temperature=0).with_structured_output(RouteDecision)
+judge_llm = ChatGroq(model=GROQ_MODEL, temperature=0).with_structured_output(RagJudge, method="json_mode")
+rewriter_llm = ChatGroq(model=GROQ_MODEL, temperature=0).with_structured_output(RewrittenQuery)
+answer_llm = ChatGroq(model=GROQ_MODEL, temperature=0.7)
 
 from typing import List, Literal, TypedDict, Annotated
 from langgraph.graph.message import add_messages
@@ -339,33 +338,17 @@ def build_agent(checkpointer):
     agent = g.compile(checkpointer=checkpointer)
     return agent
 
-# Global database variables
-db_conn = None
-checkpointer = None
-rag_agent = None
+# --- Global Execution Context Initialization (Serverless Warm Reuse) ---
+checkpointer = MemorySaver()
+rag_agent = build_agent(checkpointer)
 
 def init_agent():
-    """Initializes database pool/connection and compiles the agent graph on startup."""
-    global db_conn, checkpointer, rag_agent
-    db_path = os.path.join(os.path.dirname(__file__), "checkpoints.sqlite")
-    print(f"Initializing SQLite checkpointer at: {db_path}...")
-    
-    # Establish connection with thread-safety disabled for SQLite multi-thread access
-    db_conn = sqlite3.connect(db_path, check_same_thread=False)
-    checkpointer = SqliteSaver(db_conn)
-    
-    # Run the setup script to automatically execute native schema creation
-    checkpointer.setup()
-    
-    # Compile the state graph using the persistent checkpointer
-    rag_agent = build_agent(checkpointer)
-    print("Persistent SQLite checkpointer initialization and schema setup complete.")
+    """Idempotent initializer for backwards compatibility with FastAPI lifespan."""
+    global checkpointer, rag_agent
+    if rag_agent is None:
+        checkpointer = MemorySaver()
+        rag_agent = build_agent(checkpointer)
 
 def close_agent():
-    """Closes checkpointer database connection pool/connection cleanly on server shutdown."""
-    global db_conn
-    if db_conn:
-        print("Closing checkpointer SQLite connection...")
-        db_conn.close()
-        db_conn = None
-        print("SQLite connection closed.")
+    """No-op cleanup for stateless serverless execution."""
+    pass

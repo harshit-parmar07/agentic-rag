@@ -1,16 +1,20 @@
 import os
+import sys
 from typing import List, Dict, Any
-import tempfile
 import asyncio
 import groq
+
+# Ensure backend directory is on sys.path when invoked from root serverless entrypoints
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
 
 from fastapi import FastAPI, HTTPException, status, UploadFile, File
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, AIMessage
-
-
-
+from mangum import Mangum
 from contextlib import asynccontextmanager
+
 import agent
 from vectorstore import process_pdf_and_store
 
@@ -77,16 +81,18 @@ async def upload_document(file: UploadFile = File(...)):
             detail="Only PDF files are supported."
         )
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        file_content = await file.read()
-        tmp_file.write(file_content)
-        temp_file_path = tmp_file.name
-    
-    print(f"Received PDF for upload: {file.filename}. Saved temporarily to {temp_file_path}")
+    file_content = await file.read()
+    if not file_content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded PDF file is empty."
+        )
+
+    print(f"Received PDF for in-memory processing: {file.filename} ({len(file_content)} bytes)")
 
     try:
-        total_chunks_added = await asyncio.to_thread(process_pdf_and_store, temp_file_path)
-        
+        total_chunks_added = await asyncio.to_thread(process_pdf_and_store, file_content)
+
         return DocumentUploadResponse(
             message=f"PDF '{file.filename}' successfully uploaded and indexed.",
             filename=file.filename,
@@ -104,10 +110,6 @@ async def upload_document(file: UploadFile = File(...)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process PDF: {e}"
         )
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-            print(f"Cleaned up temporary file: {temp_file_path}")
 
 
 
@@ -224,8 +226,14 @@ async def chat_with_agent(request: QueryRequest):
     except groq.AuthenticationError as e:
         print(f"Groq Authentication Error: {e}")
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, 
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Groq API Key. Please verify your GROQ_API_KEY in config.env."
+        )
+    except groq.NotFoundError as e:
+        print(f"Groq Model Not Found Error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Groq model not found or inaccessible. Check GROQ_MODEL in config.env: {e}"
         )
     except Exception as e:
         import traceback
@@ -239,9 +247,11 @@ async def chat_with_agent(request: QueryRequest):
 async def health_check():
     return {"status": "ok"}
 
+# AWS Lambda handler via Mangum (lifespan="off" since agent is initialized in global scope)
+handler = Mangum(app, lifespan="off")
+
 if __name__ == "__main__":
     import uvicorn
-    # Port is injected by Render, defaulting to 8000 for local development
     port = int(os.environ.get("PORT", 8000))
     print(f"Starting server on 0.0.0.0:{port}...")
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
