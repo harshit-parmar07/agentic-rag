@@ -1,8 +1,9 @@
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
-export async function uploadDocument(file) {
+export async function uploadDocument(file, sessionId) {
   const formData = new FormData();
   formData.append('file', file);
+  formData.append('session_id', sessionId || localStorage.getItem('chat_session_id') || 'default');
 
   const response = await fetch(`${BASE_URL}/upload-document/`, {
     method: 'POST',

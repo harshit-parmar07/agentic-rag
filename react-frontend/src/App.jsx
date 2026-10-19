@@ -1,19 +1,27 @@
 import { useState, useEffect } from 'react';
+import { RotateCcw } from 'lucide-react';
 import Sidebar from './components/Sidebar';
 import ChatFeed from './components/ChatFeed';
 import ChatInput from './components/ChatInput';
 import { chatWithAgent } from './api';
 import './App.css';
 
+const createWelcomeMessage = () => ({
+  id: crypto.randomUUID(),
+  sender: 'agent',
+  text: 'Hello! Upload a PDF to your session knowledge base or ask me anything.',
+  traces: [],
+});
+
 export default function App() {
   const [sessionId, setSessionId] = useState('');
   const [messages, setMessages] = useState([]);
+  const [uploadedFiles, setUploadedFiles] = useState([]);
   const [webSearchEnabled, setWebSearchEnabled] = useState(true);
   const [isTyping, setIsTyping] = useState(false);
   const [error, setError] = useState(null);
 
   useEffect(() => {
-    // Initialize session ID from localStorage or create a new one
     let storedSessionId = localStorage.getItem('chat_session_id');
     if (!storedSessionId) {
       storedSessionId = crypto.randomUUID();
@@ -21,7 +29,6 @@ export default function App() {
     }
     setSessionId(storedSessionId);
 
-    // Initialize messages from localStorage if available
     const storedMessages = localStorage.getItem('chat_messages');
     if (storedMessages) {
       try {
@@ -30,22 +37,52 @@ export default function App() {
         console.error('Failed to parse stored messages', e);
       }
     } else {
-      // Welcome message
-      setMessages(prev => prev.length === 0 ? [{
-        id: crypto.randomUUID(),
-        sender: 'agent',
-        text: 'Hello! How can I help you today?',
-        traces: []
-      }] : prev);
+      setMessages((prev) => (prev.length === 0 ? [createWelcomeMessage()] : prev));
+    }
+
+    const storedFiles = localStorage.getItem('chat_uploaded_files');
+    if (storedFiles) {
+      try {
+        setUploadedFiles(JSON.parse(storedFiles));
+      } catch (e) {
+        console.error('Failed to parse stored uploaded files', e);
+      }
     }
   }, []);
 
-  // Save messages to localStorage whenever they change
   useEffect(() => {
     if (messages.length > 0) {
       localStorage.setItem('chat_messages', JSON.stringify(messages));
     }
   }, [messages]);
+
+  useEffect(() => {
+    localStorage.setItem('chat_uploaded_files', JSON.stringify(uploadedFiles));
+  }, [uploadedFiles]);
+
+  const handleNewChat = () => {
+    const newSessionId = crypto.randomUUID();
+    const initialMessages = [createWelcomeMessage()];
+    localStorage.setItem('chat_session_id', newSessionId);
+    localStorage.setItem('chat_messages', JSON.stringify(initialMessages));
+    localStorage.removeItem('chat_uploaded_files');
+    setSessionId(newSessionId);
+    setMessages(initialMessages);
+    setUploadedFiles([]);
+    setError(null);
+  };
+
+  const handleFileUploaded = (fileInfo) => {
+    setUploadedFiles((prev) => {
+      const existingIndex = prev.findIndex((item) => item.name === fileInfo.name);
+      if (existingIndex !== -1) {
+        const updated = [...prev];
+        updated[existingIndex] = fileInfo;
+        return updated;
+      }
+      return [...prev, fileInfo];
+    });
+  };
 
   const handleSendMessage = async (text) => {
     const userMessage = {
@@ -86,14 +123,29 @@ export default function App() {
 
   return (
     <div className="app-container">
-      <Sidebar 
-        webSearchEnabled={webSearchEnabled} 
-        setWebSearchEnabled={setWebSearchEnabled} 
+      <Sidebar
+        sessionId={sessionId}
+        webSearchEnabled={webSearchEnabled}
+        setWebSearchEnabled={setWebSearchEnabled}
+        uploadedFiles={uploadedFiles}
+        onFileUploaded={handleFileUploaded}
       />
       <main className="main-content">
         <header className="main-header">
           <h1>Agent Workspace</h1>
-          <span className="session-badge">Session: {sessionId.substring(0, 8)}...</span>
+          <div className="header-actions">
+            <span className="session-badge">Session: {sessionId.substring(0, 8)}...</span>
+            <button
+              type="button"
+              className="new-chat-btn"
+              onClick={handleNewChat}
+              disabled={isTyping}
+              title="Start a new isolated session"
+            >
+              <RotateCcw size={14} />
+              <span>New Chat</span>
+            </button>
+          </div>
         </header>
         <div className="chat-container">
           <ChatFeed messages={messages} isTyping={isTyping} />

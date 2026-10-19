@@ -1,9 +1,11 @@
+import hashlib
 import io
 import os
 from typing import List, Union
 import requests
 from pypdf import PdfReader
 from pinecone import Pinecone, ServerlessSpec
+from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -119,32 +121,63 @@ def get_vectorstore() -> PineconeVectorStore:
     return _vectorstore
 
 
-def get_retriever():
-    """Returns a globally cached Pinecone retriever instance for warm invocation reuse."""
-    global _retriever
-    if _retriever is None:
-        _retriever = get_vectorstore().as_retriever()
-    return _retriever
+def get_retriever(namespace: str = "default", k: int = 5):
+    """Returns a namespace-scoped Pinecone retriever instance."""
+    return get_vectorstore().as_retriever(
+        search_kwargs={"namespace": namespace or "default", "k": k}
+    )
 
 
-def add_document_to_vectorstore(text_content: str) -> int:
-    """Splits text into chunks and upserts them into the cached Pinecone vectorstore."""
-    if not text_content or not text_content.strip():
+def add_documents_to_vectorstore(
+    page_documents: List[Document],
+    filename: str = "document.pdf",
+    namespace: str = "default",
+) -> int:
+    """
+    Splits page-level Documents into chunks (preserving source & page metadata)
+    and idempotently upserts them into a session-isolated Pinecone namespace.
+    """
+    if not page_documents:
         raise ValueError("Document content cannot be empty.")
 
-    documents = _text_splitter.create_documents([text_content])
-    print(f"Splitting document into {len(documents)} chunks for indexing...")
+    target_namespace = namespace or "default"
+    chunks = _text_splitter.split_documents(page_documents)
+    if not chunks:
+        raise ValueError("No text chunks could be generated from the PDF.")
+
+    chunk_ids = []
+    for idx, chunk in enumerate(chunks):
+        source = chunk.metadata.get("source", filename)
+        page = chunk.metadata.get("page", 1)
+        chunk.metadata["chunk_index"] = idx
+        raw_key = f"{target_namespace}:{source}:{page}:{idx}:{chunk.page_content}"
+        chunk_ids.append(hashlib.sha256(raw_key.encode("utf-8")).hexdigest())
+
+    print(
+        f"Upserting {len(chunks)} chunks into Pinecone index '{INDEX_NAME}' "
+        f"(namespace='{target_namespace}')..."
+    )
 
     vectorstore = get_vectorstore()
-    vectorstore.add_documents(documents)
-    print(f"Successfully added {len(documents)} chunks to Pinecone index '{INDEX_NAME}'.")
-    return len(documents)
+    vectorstore.add_documents(
+        documents=chunks,
+        ids=chunk_ids,
+        namespace=target_namespace,
+    )
+    print(
+        f"Successfully indexed {len(chunks)} idempotent chunks in namespace '{target_namespace}'."
+    )
+    return len(chunks)
 
 
-def process_pdf_and_store(pdf_source: Union[bytes, io.BytesIO, str]) -> int:
+def process_pdf_and_store(
+    pdf_source: Union[bytes, io.BytesIO, str],
+    filename: str = "document.pdf",
+    namespace: str = "default",
+) -> int:
     """
-    Extracts text from a PDF in memory (bytes/BytesIO) or from a /tmp file path
-    without requiring persistent local disk storage.
+    Extracts text per page in memory with source/page metadata and stores
+    idempotent chunks in the session's Pinecone namespace.
     """
     if isinstance(pdf_source, bytes):
         stream = io.BytesIO(pdf_source)
@@ -154,15 +187,22 @@ def process_pdf_and_store(pdf_source: Union[bytes, io.BytesIO, str]) -> int:
     else:
         reader = PdfReader(pdf_source)
 
-    pages_text = []
-    for page in reader.pages:
+    page_documents: List[Document] = []
+    for page_num, page in enumerate(reader.pages, start=1):
         extracted = page.extract_text()
         if extracted and extracted.strip():
-            pages_text.append(extracted)
+            page_documents.append(
+                Document(
+                    page_content=extracted.strip(),
+                    metadata={"source": filename, "page": page_num},
+                )
+            )
 
-    if not pages_text:
+    if not page_documents:
         raise ValueError("Could not extract any readable text from the uploaded PDF.")
 
-    full_text_content = "\n\n".join(pages_text)
-    add_document_to_vectorstore(full_text_content)
-    return len(pages_text)
+    return add_documents_to_vectorstore(
+        page_documents=page_documents,
+        filename=filename,
+        namespace=namespace,
+    )

@@ -15,32 +15,41 @@ from vectorstore import get_retriever
 
 
 @tool
-def rag_search_tool(query: str) -> str:
-    """Top-K chunks from KB (empty string if none)"""
+def rag_search_tool(query: str, namespace: str = "default") -> str:
+    """Top-K chunks from session-scoped KB with source and page citations (empty string if none)"""
     try:
-        retriever_instance = get_retriever()
-        docs = retriever_instance.invoke(query, k=5) # Increased from 3 to 5
-        return "\n\n".join(d.page_content for d in docs) if docs else ""
+        retriever_instance = get_retriever(namespace=namespace, k=5)
+        docs = retriever_instance.invoke(query)
+        if not docs:
+            return ""
+        formatted_chunks = []
+        for d in docs:
+            source = d.metadata.get("source", "Uploaded PDF")
+            page = d.metadata.get("page", "?")
+            formatted_chunks.append(
+                f"[Source: {source}, Page: {page}]\n{d.page_content}"
+            )
+        return "\n\n".join(formatted_chunks)
     except Exception as e:
         return f"RAG_ERROR::{e}"
 
 # --- Pydantic schemas for structured output ---
 class RouteDecision(BaseModel):
+    standalone_query: str = Field(
+        ...,
+        description="The contextually resolved, standalone query rephrased from conversation history (or unchanged if already standalone)."
+    )
     route: Literal["rag", "web", "answer", "end"]
     reply: str | None = Field(None, description="Filled only when route == 'end'")
 
 class RagJudge(BaseModel):
     sufficient: bool = Field(..., description="True if retrieved information is sufficient to answer the user's question, False otherwise.")
 
-class RewrittenQuery(BaseModel):
-    standalone_query: str = Field(..., description="The contextually resolved, standalone query.")
-
 # --- LLM instances with structured output where needed ---
 os.environ["GROQ_API_KEY"] = GROQ_API_KEY or "dummy-key"
 
 router_llm = ChatGroq(model=GROQ_MODEL, temperature=0).with_structured_output(RouteDecision)
 judge_llm = ChatGroq(model=GROQ_MODEL, temperature=0).with_structured_output(RagJudge, method="json_mode")
-rewriter_llm = ChatGroq(model=GROQ_MODEL, temperature=0).with_structured_output(RewrittenQuery)
 answer_llm = ChatGroq(model=GROQ_MODEL, temperature=0.7)
 
 from typing import List, Literal, TypedDict, Annotated
@@ -54,124 +63,85 @@ class AgentState(TypedDict, total=False):
     rag: str
     web: str
 
-# --- Node 0: query rewriter ---
-def query_rewriter_node(state: AgentState) -> AgentState:
-    print("\n--- Entering query_rewriter_node ---")
+# --- Node 1: Unified Query Rewriter + Router (single LLM call) ---
+def router_node(state: AgentState, config: RunnableConfig) -> AgentState:
+    print("\n--- Entering unified router_node (Rewrite + Route) ---")
     messages = state.get("messages", [])
-    
-    if len(messages) <= 1:
-        query = next((m.content for m in reversed(messages) if isinstance(m, HumanMessage)), "")
-        print("Bypassing rewriter (first message).")
-        return {**state, "standalone_query": query}
-        
-    query = next((m.content for m in reversed(messages) if isinstance(m, HumanMessage)), "")
-    
-    system_prompt = (
-        "Given the following conversation and a follow-up question, "
-        "rephrase the follow-up question to be a standalone query that captures all relevant context. "
-        "If it is already standalone, return it unchanged. Do not answer the question."
-    )
-    
-    llm_messages = [("system", system_prompt)] + messages[:-1] + [("user", query)]
-    
-    try:
-        result = rewriter_llm.invoke(llm_messages)
-        standalone_query = result.standalone_query
-    except Exception as e:
-        print(f"Rewriter LLM error: {e}. Falling back to raw query.")
-        standalone_query = query
-        
-    print(f"Rewritten query: {standalone_query}")
-    print("--- Exiting query_rewriter_node ---")
-    return {**state, "standalone_query": standalone_query}
+    raw_query = next((m.content for m in reversed(messages) if isinstance(m, HumanMessage)), "")
 
-# --- Node 1: router (decision) ---
-def router_node(state: AgentState,config : RunnableConfig) -> AgentState:
-    print("\n--- Entering router_node ---")
-    print(f"Messages in state: {state.get('messages', [])}")
-    query = state.get("standalone_query", "")
-    
     web_search_enabled = config.get("configurable", {}).get("web_search_enabled", True)
     print(f"Router received web search info: {web_search_enabled}")
- 
+
     system_prompt = (
-        "You are an intelligent routing agent designed to direct user queries to the most appropriate tool."
-        "Your primary goal is to provide accurate and relevant information by selecting the best source."
-        "Prioritize using the **internal knowledge base (RAG)** for factual information that is likely "
-        "to be contained within pre-uploaded documents or for common, well-established facts."
+        "You are an intelligent query-rewriting and routing agent.\n"
+        " Perform TWO tasks in a single structured output:\n"
+        "1. `standalone_query`: Given the conversation history and the user's latest message, rephrase the latest message "
+        "into a standalone query that resolves all pronouns/references (or return it unchanged if it is already standalone or a greeting).\n"
+        "2. `route`: Direct the `standalone_query` to the most appropriate route. Prioritize using the **internal knowledge base (RAG)** "
+        "for factual information likely contained in uploaded documents or well-established domain knowledge.\n"
     )
-    
+
     if web_search_enabled:
         system_prompt += (
-            "You **CAN** use web search for queries that require very current, real-time, or broad general knowledge "
-            "that is unlikely to be in a specific, static knowledge base (e.g., today's news, live data, very recent events)."
-            "\n\nChoose one of the following routes:"
-            "\n- 'rag': For queries about specific entities, historical facts, product details, procedures, or any information that would typically be found in a curated document collection (e.g., 'What is X?', 'How does Y work?', 'Explain Z policy')."
-            "\n- 'web': For queries about current events, live data, very recent news, or broad general knowledge that requires up-to-date internet access (e.g., 'Who won the election yesterday?', 'What is the weather in London?', 'Latest news on technology')."
+            "You **CAN** use web search for queries that require current, real-time, or live internet knowledge.\n"
+            "\nChoose one of the following routes:\n"
+            "- 'rag': Specific entities, uploaded document questions, procedures, technical facts, or general knowledge.\n"
+            "- 'web': Current events, live data, recent news, or real-time information.\n"
         )
     else:
         system_prompt += (
-            "**Web search is currently DISABLED.** You **MUST NOT** choose the 'web' route."
-            "If a query would normally require web search, you should attempt to answer it using RAG (if applicable) or directly from your general knowledge."
-            "\n\nChoose one of the following routes:"
-            "\n- 'rag': For queries about specific entities, historical facts, product details, procedures, or any information that would typically be found in a curated document collection, AND for queries that would normally go to web search but web search is disabled."
-            "\n- 'answer': For very simple, direct questions you can answer without any external lookup (e.g., 'What is your name?')."
+            "**Web search is currently DISABLED.** You **MUST NOT** choose the 'web' route.\n"
+            "\nChoose one of the following routes:\n"
+            "- 'rag': Specific entities, uploaded document questions, procedures, or queries that would otherwise need search.\n"
         )
 
     system_prompt += (
-        "\n- 'answer': For very simple, direct questions you can answer without any external lookup (e.g., 'What is your name?')."
-        "\n- 'end': For pure greetings or small-talk where no factual answer is expected (e.g., 'Hi', 'How are you?'). If choosing 'end', you MUST provide a 'reply'."
-        "\n\nExample routing decisions:"
-        "\n- User: 'What are the treatments for diabetes?' -> Route: 'rag' (Factual knowledge, likely in KB)."
-        "\n- User: 'What is the capital of France?' -> Route: 'rag' (Common knowledge, can be in KB or answered directly if LLM knows)."
-        "\n- User: 'Who won the NBA finals last night?' -> Route: 'web' (Current event, requires live data)."
-        "\n- User: 'How do I submit an expense report?' -> Route: 'rag' (Internal procedure)."
-        "\n- User: 'Tell me about quantum computing.' -> Route: 'rag' (Foundational knowledge can be in KB. If KB is sparse, judge will route to web if enabled)."
-        "\n- User: 'Hello there!' -> Route: 'end', reply='Hello! How can I assist you today?'"
+        "- 'answer': Simple conversational or meta questions you can answer directly without lookup (e.g., 'What can you do?').\n"
+        "- 'end': Pure greetings or small-talk where no factual lookup is needed (e.g., 'Hi', 'Thanks!'). If choosing 'end', you MUST populate `reply`.\n"
     )
 
-    messages = [
-        ("system", system_prompt),
-        ("user", query)
-    ]
-    
-    result: RouteDecision = router_llm.invoke(messages)
-    
-    initial_router_decision = result.route # Store the LLM's raw decision
+    # Pass recent conversation history (up to last 6 messages) so follow-up questions are resolved in the same call
+    history_window = messages[:-1][-6:] if len(messages) > 1 else []
+    llm_messages = [("system", system_prompt)] + history_window + [("user", raw_query)]
+
+    result: RouteDecision = router_llm.invoke(llm_messages)
+    standalone_query = (result.standalone_query or raw_query).strip() or raw_query
+
+    initial_router_decision = result.route
     router_override_reason = None
 
-    # Override router decision if web search is disabled and LLM chose 'web'
     if not web_search_enabled and result.route == "web":
-        # If web search is disabled, force it to try RAG instead
-        result.route = "rag" 
+        result.route = "rag"
         router_override_reason = "Web search disabled by user; redirected to RAG."
-        print(f"Router decision overridden: changed from 'web' to 'rag' because web search is disabled.")
-    
-    print(f"Router final decision: {result.route}, Reply (if 'end'): {result.reply}")
-    
+        print("Router decision overridden: changed from 'web' to 'rag' because web search is disabled.")
+
+    print(f"Standalone query: {standalone_query} | Route: {result.route} | Reply: {result.reply}")
+
     out = {
-        "messages": state["messages"], 
-        "route": result.route
+        "messages": state["messages"],
+        "standalone_query": standalone_query,
+        "route": result.route,
     }
-    if router_override_reason: # Add override info for tracing
+    if router_override_reason:
         out["initial_router_decision"] = initial_router_decision
         out["router_override_reason"] = router_override_reason
 
     if result.route == "end":
-        out["messages"] = state["messages"] + [AIMessage(content=result.reply or "Hello!")]
-    
-    print("--- Exiting router_node ---")
+        out["messages"] = state["messages"] + [AIMessage(content=result.reply or "Hello! How can I help you today?")]
+
+    print("--- Exiting unified router_node ---")
     return out
 
 # --- Node 2: RAG lookup ---
-def rag_node(state: AgentState,config:RunnableConfig) -> AgentState:
+def rag_node(state: AgentState, config: RunnableConfig) -> AgentState:
     print("\n--- Entering rag_node ---")
     query = state.get("standalone_query", "")
-    # Get web_search_enabled directly from the config
-    web_search_enabled = config.get("configurable", {}).get("web_search_enabled", True)
-    print(f"RAG node received web search info: {web_search_enabled}")
+    configurable = config.get("configurable", {})
+    web_search_enabled = configurable.get("web_search_enabled", True)
+    session_namespace = configurable.get("thread_id", "default") or "default"
+    print(f"RAG node received web search info: {web_search_enabled}, namespace: {session_namespace}")
     print(f"RAG query: {query}")
-    chunks = rag_search_tool.invoke(query)
+    chunks = rag_search_tool.invoke({"query": query, "namespace": session_namespace})
     
     if chunks.startswith("RAG_ERROR::"):
         print(f"RAG Error: {chunks}. Checking web search enabled status.")
@@ -267,6 +237,7 @@ def answer_node(state: AgentState) -> AgentState:
 
     prompt = f"""Please answer the user's question using the provided context.
 If the context is empty or irrelevant, try to answer based on your general knowledge.
+When using information from the Knowledge Base, always cite the document source and page number inline (e.g., [Source: file.pdf, Page: 1]).
 
 Question: {user_q}
 
@@ -303,14 +274,12 @@ def after_web(_) -> Literal["answer"]:
 def build_agent(checkpointer):
     """Builds and compiles the LangGraph agent with a checkpointer."""
     g = StateGraph(AgentState)
-    g.add_node("query_rewriter", query_rewriter_node)
     g.add_node("router", router_node)
     g.add_node("rag_lookup", rag_node)
     g.add_node("web_search", web_node)
     g.add_node("answer", answer_node)
 
-    g.set_entry_point("query_rewriter")
-    g.add_edge("query_rewriter", "router")
+    g.set_entry_point("router")
     
     g.add_conditional_edges(
         "router",

@@ -1,3 +1,5 @@
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import TraceViewer from './TraceViewer';
 import { Bot, User } from 'lucide-react';
 import './MessageBubble.css';
@@ -11,8 +13,14 @@ export default function MessageBubble({ message }) {
         {isAgent ? <Bot size={20} /> : <User size={20} />}
       </div>
       <div className="message-content">
-        <div className="message-text">
-          {message.text}
+        <div className={`message-text ${isAgent ? 'markdown-body' : ''}`}>
+          {isAgent ? (
+            <ReactMarkdown remarkPlugins={[remarkGfm]}>
+              {message.text}
+            </ReactMarkdown>
+          ) : (
+            message.text
+          )}
         </div>
         {isAgent && message.traces && message.traces.length > 0 && (
           <TraceViewer traces={message.traces} />

@@ -1,16 +1,34 @@
 import { useState } from 'react';
 import { uploadDocument } from '../api';
-import { UploadCloud, CheckCircle, AlertCircle, Loader2 } from 'lucide-react';
+import { UploadCloud, CheckCircle, AlertCircle, Loader2, FileText } from 'lucide-react';
 import './Sidebar.css';
 
-export default function Sidebar({ webSearchEnabled, setWebSearchEnabled }) {
+const MAX_FILE_SIZE_BYTES = 4.5 * 1024 * 1024; // 4.5 MB
+
+export default function Sidebar({
+  sessionId,
+  webSearchEnabled,
+  setWebSearchEnabled,
+  uploadedFiles = [],
+  onFileUploaded,
+}) {
   const [file, setFile] = useState(null);
   const [uploadStatus, setUploadStatus] = useState('idle'); // idle, uploading, success, error
   const [statusMessage, setStatusMessage] = useState('');
 
   const handleFileChange = (e) => {
     if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0]);
+      const selected = e.target.files[0];
+      if (selected.size > MAX_FILE_SIZE_BYTES) {
+        setUploadStatus('error');
+        setStatusMessage('File exceeds the 4.5 MB maximum limit.');
+        setFile(null);
+        e.target.value = '';
+        return;
+      }
+      setUploadStatus('idle');
+      setStatusMessage('');
+      setFile(selected);
     }
   };
 
@@ -19,9 +37,16 @@ export default function Sidebar({ webSearchEnabled, setWebSearchEnabled }) {
     setUploadStatus('uploading');
     setStatusMessage('Uploading and indexing document...');
     try {
-      const result = await uploadDocument(file);
+      const result = await uploadDocument(file, sessionId);
       setUploadStatus('success');
       setStatusMessage(result.message || 'Document indexed successfully!');
+      if (onFileUploaded) {
+        onFileUploaded({
+          name: result.filename || file.name,
+          chunks: result.processed_chunks || 0,
+        });
+      }
+      setFile(null);
     } catch (error) {
       setUploadStatus('error');
       setStatusMessage(error.message);
@@ -72,6 +97,21 @@ export default function Sidebar({ webSearchEnabled, setWebSearchEnabled }) {
           <div className="status-toast error">
             <AlertCircle size={16} />
             <span>{statusMessage}</span>
+          </div>
+        )}
+
+        {uploadedFiles.length > 0 && (
+          <div className="indexed-files-wrapper">
+            <h4 className="indexed-files-title">Session Documents ({uploadedFiles.length})</h4>
+            <ul className="indexed-files-list">
+              {uploadedFiles.map((doc, idx) => (
+                <li key={`${doc.name}-${idx}`} className="indexed-file-item">
+                  <FileText size={14} className="indexed-file-icon" />
+                  <span className="indexed-file-name" title={doc.name}>{doc.name}</span>
+                  <span className="indexed-file-badge">{doc.chunks} chunks</span>
+                </li>
+              ))}
+            </ul>
           </div>
         )}
       </div>

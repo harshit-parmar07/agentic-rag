@@ -9,7 +9,7 @@ _BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-from fastapi import FastAPI, HTTPException, status, UploadFile, File
+from fastapi import FastAPI, HTTPException, status, UploadFile, File, Form
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, AIMessage
 from mangum import Mangum
@@ -69,16 +69,22 @@ class DocumentUploadResponse(BaseModel):
     filename: str
     processed_chunks: int
 
+MAX_PDF_SIZE_BYTES = int(4.5 * 1024 * 1024)  # 4.5 MB limit for serverless payload safety
+
 # --- Document Upload Endpoint ---
 @app.post("/upload-document/", response_model=DocumentUploadResponse, status_code=status.HTTP_200_OK)
-async def upload_document(file: UploadFile = File(...)):
+async def upload_document(
+    file: UploadFile = File(...),
+    session_id: str = Form("default"),
+):
     """
-    Uploads a PDF document, extracts text, and adds it to the RAG knowledge base.
+    Uploads a PDF document, validates size & magic bytes, extracts text per page,
+    and indexes idempotent chunks into the user session's isolated Pinecone namespace.
     """
-    if not file.filename.endswith(".pdf"):
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only PDF files are supported."
+            detail="Only PDF files (.pdf) are supported."
         )
 
     file_content = await file.read()
@@ -88,10 +94,31 @@ async def upload_document(file: UploadFile = File(...)):
             detail="Uploaded PDF file is empty."
         )
 
-    print(f"Received PDF for in-memory processing: {file.filename} ({len(file_content)} bytes)")
+    if len(file_content) > MAX_PDF_SIZE_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail="PDF file exceeds the 4.5 MB maximum serverless upload size limit."
+        )
+
+    if not file_content.startswith(b"%PDF-"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid file content: file does not have a valid %PDF- header."
+        )
+
+    target_namespace = (session_id or "default").strip() or "default"
+    print(
+        f"Received PDF for in-memory processing: {file.filename} "
+        f"({len(file_content)} bytes) in namespace '{target_namespace}'"
+    )
 
     try:
-        total_chunks_added = await asyncio.to_thread(process_pdf_and_store, file_content)
+        total_chunks_added = await asyncio.to_thread(
+            process_pdf_and_store,
+            file_content,
+            file.filename,
+            target_namespace,
+        )
 
         return DocumentUploadResponse(
             message=f"PDF '{file.filename}' successfully uploaded and indexed.",
@@ -150,16 +177,24 @@ async def chat_with_agent(request: QueryRequest):
 
             if current_node_name == "router":
                 route_decision = node_output_state.get('route')
-                # Check for overridden route if web search was disabled
+                standalone_query = node_output_state.get('standalone_query', '')
                 initial_decision = node_output_state.get('initial_router_decision', route_decision)
                 override_reason = node_output_state.get('router_override_reason', None)
 
                 if override_reason:
-                    event_description = f"Router initially decided: '{initial_decision}'. Overridden to: '{route_decision}' because {override_reason}."
-                    event_details = {"initial_decision": initial_decision, "final_decision": route_decision, "override_reason": override_reason}
+                    event_description = f"Rewrote query & routed: '{initial_decision}' -> overridden to '{route_decision}' ({override_reason})."
+                    event_details = {
+                        "standalone_query": standalone_query,
+                        "initial_decision": initial_decision,
+                        "final_decision": route_decision,
+                        "override_reason": override_reason,
+                    }
                 else:
-                    event_description = f"Router decided: '{route_decision}'"
-                    event_details = {"decision": route_decision, "reason": "Based on initial query analysis."}
+                    event_description = f"Resolved query & selected route: '{route_decision}'"
+                    event_details = {
+                        "standalone_query": standalone_query,
+                        "decision": route_decision,
+                    }
                 event_type = "router_decision"
             elif current_node_name == "rag_lookup":
                 rag_content_summary = node_output_state.get("rag", "")[:200] + "..."
