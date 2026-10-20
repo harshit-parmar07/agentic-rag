@@ -6,6 +6,7 @@ config.env
 # Virtual environment & dependencies
 venv/
 node_modules/
+.vscode/
 
 # Python cache & runtime outputs
 __pycache__/

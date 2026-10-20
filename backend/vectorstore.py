@@ -5,9 +5,11 @@ from typing import List, Union
 import requests
 from pypdf import PdfReader
 from pinecone import Pinecone, ServerlessSpec
+from pydantic import Field
+from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_pinecone import PineconeVectorStore
+from langchain_core.retrievers import BaseRetriever
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from config import (
@@ -27,8 +29,7 @@ pc = Pinecone(api_key=PINECONE_API_KEY) if PINECONE_API_KEY else None
 INDEX_NAME = PINECONE_INDEX_NAME
 _INDEX_CHECKED = False
 _embeddings: Embeddings | None = None
-_vectorstore: PineconeVectorStore | None = None
-_retriever = None
+_pinecone_index = None
 _text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000,
     chunk_overlap=200,
@@ -61,16 +62,21 @@ class ServerlessEmbeddings(Embeddings):
     def _embed_via_pinecone(self, texts: List[str], input_type: str) -> List[List[float]]:
         if not pc:
             raise ValueError("Pinecone client is not initialized. Configure PINECONE_API_KEY.")
-        res = pc.inference.embed(
-            model=PINECONE_EMBED_MODEL,
-            inputs=texts,
-            parameters={
-                "input_type": input_type,
-                "truncate": "END",
-                "dimension": EMBED_DIMENSION,
-            },
-        )
-        return [item["values"] for item in res.data]
+        all_embeddings: List[List[float]] = []
+        batch_size = 64
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            res = pc.inference.embed(
+                model=PINECONE_EMBED_MODEL,
+                inputs=batch,
+                parameters={
+                    "input_type": input_type,
+                    "truncate": "END",
+                    "dimension": EMBED_DIMENSION,
+                },
+            )
+            all_embeddings.extend(item["values"] for item in res.data)
+        return all_embeddings
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         if HF_API_KEY:
@@ -112,20 +118,44 @@ def ensure_index_exists():
     _INDEX_CHECKED = True
 
 
-def get_vectorstore() -> PineconeVectorStore:
-    """Returns a globally cached PineconeVectorStore instance."""
-    global _vectorstore
-    if _vectorstore is None:
+def get_pinecone_index():
+    """Returns a globally cached Pinecone Index client (serverless-safe, no multiprocessing)."""
+    global _pinecone_index
+    if _pinecone_index is None:
         ensure_index_exists()
-        _vectorstore = PineconeVectorStore(index_name=INDEX_NAME, embedding=get_embeddings())
-    return _vectorstore
+        _pinecone_index = pc.Index(INDEX_NAME)
+    return _pinecone_index
+
+
+class ServerlessPineconeRetriever(BaseRetriever):
+    """Lightweight synchronous Pinecone retriever that avoids multiprocessing.Pool in serverless."""
+    namespace: str = Field(default="default")
+    k: int = Field(default=5)
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun | None = None
+    ) -> List[Document]:
+        index = get_pinecone_index()
+        query_vector = get_embeddings().embed_query(query)
+        response = index.query(
+            vector=query_vector,
+            top_k=self.k,
+            namespace=self.namespace or "default",
+            include_metadata=True,
+        )
+        docs: List[Document] = []
+        matches = getattr(response, "matches", None) or response.get("matches", [])
+        for match in matches:
+            metadata = dict(getattr(match, "metadata", None) or match.get("metadata", {}) or {})
+            text = metadata.pop("text", "")
+            if text:
+                docs.append(Document(page_content=text, metadata=metadata))
+        return docs
 
 
 def get_retriever(namespace: str = "default", k: int = 5):
-    """Returns a namespace-scoped Pinecone retriever instance."""
-    return get_vectorstore().as_retriever(
-        search_kwargs={"namespace": namespace or "default", "k": k}
-    )
+    """Returns a namespace-scoped ServerlessPineconeRetriever instance."""
+    return ServerlessPineconeRetriever(namespace=namespace or "default", k=k)
 
 
 def add_documents_to_vectorstore(
@@ -135,7 +165,7 @@ def add_documents_to_vectorstore(
 ) -> int:
     """
     Splits page-level Documents into chunks (preserving source & page metadata)
-    and idempotently upserts them into a session-isolated Pinecone namespace.
+    and synchronously upserts them into a session-isolated Pinecone namespace.
     """
     if not page_documents:
         raise ValueError("Document content cannot be empty.")
@@ -145,29 +175,45 @@ def add_documents_to_vectorstore(
     if not chunks:
         raise ValueError("No text chunks could be generated from the PDF.")
 
-    chunk_ids = []
-    for idx, chunk in enumerate(chunks):
+    texts = [chunk.page_content for chunk in chunks]
+    vectors_values = get_embeddings().embed_documents(texts)
+
+    vectors_to_upsert = []
+    for idx, (chunk, values) in enumerate(zip(chunks, vectors_values)):
         source = chunk.metadata.get("source", filename)
         page = chunk.metadata.get("page", 1)
-        chunk.metadata["chunk_index"] = idx
         raw_key = f"{target_namespace}:{source}:{page}:{idx}:{chunk.page_content}"
-        chunk_ids.append(hashlib.sha256(raw_key.encode("utf-8")).hexdigest())
+        vec_id = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+        vectors_to_upsert.append(
+            {
+                "id": vec_id,
+                "values": values,
+                "metadata": {
+                    "text": chunk.page_content,
+                    "source": source,
+                    "page": page,
+                    "chunk_index": idx,
+                },
+            }
+        )
 
     print(
-        f"Upserting {len(chunks)} chunks into Pinecone index '{INDEX_NAME}' "
+        f"Upserting {len(vectors_to_upsert)} chunks into Pinecone index '{INDEX_NAME}' "
         f"(namespace='{target_namespace}')..."
     )
 
-    vectorstore = get_vectorstore()
-    vectorstore.add_documents(
-        documents=chunks,
-        ids=chunk_ids,
-        namespace=target_namespace,
-    )
+    index = get_pinecone_index()
+    upsert_batch_size = 100
+    for i in range(0, len(vectors_to_upsert), upsert_batch_size):
+        index.upsert(
+            vectors=vectors_to_upsert[i : i + upsert_batch_size],
+            namespace=target_namespace,
+        )
+
     print(
-        f"Successfully indexed {len(chunks)} idempotent chunks in namespace '{target_namespace}'."
+        f"Successfully indexed {len(vectors_to_upsert)} idempotent chunks in namespace '{target_namespace}'."
     )
-    return len(chunks)
+    return len(vectors_to_upsert)
 
 
 def process_pdf_and_store(
