@@ -71,8 +71,9 @@ class DocumentUploadResponse(BaseModel):
 
 MAX_PDF_SIZE_BYTES = int(4.5 * 1024 * 1024)  # 4.5 MB limit for serverless payload safety
 
-# --- Document Upload Endpoint ---
-@app.post("/upload-document/", response_model=DocumentUploadResponse, status_code=status.HTTP_200_OK)
+# --- Document Upload Endpoint (supports both /upload-document and /upload-document/) ---
+@app.post("/upload-document", response_model=DocumentUploadResponse, status_code=status.HTTP_200_OK)
+@app.post("/upload-document/", response_model=DocumentUploadResponse, status_code=status.HTTP_200_OK, include_in_schema=False)
 async def upload_document(
     file: UploadFile = File(...),
     session_id: str = Form("default"),
@@ -140,8 +141,9 @@ async def upload_document(
 
 
 
-# --- Chat Endpoint ---
-@app.post("/chat/", response_model=AgentResponse)
+# --- Chat Endpoint (supports both /chat and /chat/) ---
+@app.post("/chat", response_model=AgentResponse)
+@app.post("/chat/", response_model=AgentResponse, include_in_schema=False)
 async def chat_with_agent(request: QueryRequest):
     trace_events_for_frontend: List[TraceEvent] = []
     
@@ -278,7 +280,12 @@ async def chat_with_agent(request: QueryRequest):
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Internal Server Error: {e}")
     
 
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "Intelligent PDF Retrieval System API"}
+
 @app.get("/health")
+@app.get("/health/", include_in_schema=False)
 async def health_check():
     return {"status": "ok"}
 
